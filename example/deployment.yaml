@@ -1,0 +1,16 @@
+# Deliberately vulnerable Kubernetes sample for the DevSecOps reviewer demo.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: myapp:latest
+          securityContext:
+            privileged: true
+          env:
+            - name: DATABASE_URL
+              value: postgres://admin:hunter2@db.internal:5432/app
