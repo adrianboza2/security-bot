@@ -1,0 +1,79 @@
+name: DevSecOps security review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "**.tf"
+      - "**.yaml"
+      - "**.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-security-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  security-review:
+    name: AI infrastructure security audit
+    # GITHUB_TOKEN is read-only and secrets are not exposed on PRs from forks,
+    # so the review bot only runs for branches in this repository.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build infrastructure diff (base64)
+        id: diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          RANGE="${BASE_SHA}...${HEAD_SHA}"
+
+          # Only .tf / .yaml / .yml, and only added/modified content (exclude pure deletions).
+          if git diff --quiet "${RANGE}" -- '*.tf' '*.yaml' '*.yml'; then
+            RAW=""
+          else
+            RAW="$(git diff --diff-filter=ACMR --unified=5 "${RANGE}" -- '*.tf' '*.yaml' '*.yml')"
+          fi
+
+          if [ -n "${RAW}" ] && [ "${#RAW}" -gt 150000 ]; then
+            # Transport safety cap: keep the tail (most recent changes) and encode.
+            RAW="${RAW: -150000}"
+            echo "truncated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "truncated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          B64="$(printf '%s' "${RAW}" | base64 -w0)"
+          echo "b64=${B64}" >> "$GITHUB_OUTPUT"
+          echo "diff_bytes=${#RAW}" >> "$GITHUB_OUTPUT"
+
+      - name: Run AI audit and post review
+        id: audit
+        env:
+          DIFF_B64: ${{ steps.diff.outputs.b64 }}
+          DIFF_TRUNCATED: ${{ steps.diff.outputs.truncated }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Provider configuration. Values must be set as repository secrets.
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
+          AI_MODEL: ${{ secrets.AI_MODEL }}
+          # Optional tuning. Values may be set as repository variables.
+          AI_MAX_DIFF_CHARS: ${{ vars.AI_MAX_DIFF_CHARS }}
+          AI_TIMEOUT: ${{ vars.AI_TIMEOUT }}
+          POST_CLEAN_REVIEW: ${{ vars.POST_CLEAN_REVIEW }}
+        run: python3 scripts/security_review.py

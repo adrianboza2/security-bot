@@ -1,0 +1,41 @@
+diff --git a/example/main.tf b/example/main.tf
+new file mode 100644
+index 0000000..1a2b3c4
+--- /dev/null
++++ b/example/main.tf
+@@ -0,0 +1,16 @@
++resource "aws_s3_bucket" "logs" {
++  bucket = "acme-public-logs"
++}
++
++resource "aws_s3_bucket_acl" "logs_acl" {
++  bucket = aws_s3_bucket.logs.id
++  acl    = "public-read"
++}
++
++resource "aws_security_group" "web" {
++  ingress {
++    from_port = 22
++    to_port   = 22
++    cidr_blocks = ["0.0.0.0/0"]
++  }
++}
+diff --git a/example/deployment.yaml b/example/deployment.yaml
+new file mode 100644
+index 0000000..9z8y7x6
+--- /dev/null
++++ b/example/deployment.yaml
+@@ -0,0 +1,13 @@
++apiVersion: apps/v1
++kind: Deployment
++spec:
++  template:
++    spec:
++      containers:
++        - name: app
++          image: myapp:latest
++          securityContext:
++            privileged: true
++          env:
++            - name: DATABASE_URL
++              value: postgres://admin:hunter2@db.internal:5432/app
