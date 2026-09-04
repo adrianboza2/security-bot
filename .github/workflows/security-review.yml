@@ -76,4 +76,8 @@ jobs:
           AI_MAX_DIFF_CHARS: ${{ vars.AI_MAX_DIFF_CHARS }}
           AI_TIMEOUT: ${{ vars.AI_TIMEOUT }}
           POST_CLEAN_REVIEW: ${{ vars.POST_CLEAN_REVIEW }}
+          # Token for publishing the review on the PR. Explicitly passed so the
+          # script sees it in this step's environment (it auto-uses dry-run otherwise).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: python3 scripts/security_review.py
