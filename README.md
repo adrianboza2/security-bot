@@ -129,11 +129,30 @@ You can verify the clean path by opening a second PR with only a harmless change
 (e.g. a comment or a private bucket) — the bot posts a review stating that no issues
 were found (disable that with `POST_CLEAN_REVIEW=false`).
 
-### 3. Manual local run (dry-run)
+### 3. Local end-to-end smoke test (no API key)
 
-If you want to see the parsed JSON without publishing, run the script locally with a
-provider key — it prints the review and skips publishing when `GITHUB_TOKEN` / PR
-context is absent:
+The repo ships a tiny fake OpenAI-compatible provider (`tests/fake_provider.py`)
+so you can run the whole pipeline locally without a real key. It returns a canned
+review flagging a public S3 bucket and an open SSH group.
+
+```bash
+# terminal 1: start the fake provider
+python3 tests/fake_provider.py 8123
+
+# terminal 2: run the script in dry-run (no GITHUB_TOKEN -> publishing is skipped)
+DIFF_B64="$(base64 -w0 tests/fixtures/infra.diff)" \
+  AI_API_KEY=fake AI_BASE_URL=http://127.0.0.1:8123/v1 AI_MODEL=fake-model \
+  python3 scripts/security_review.py
+```
+
+You should see two findings (critical public-bucket ACL, high `0.0.0.0/0` SSH)
+printed as parsed JSON, with `"mode": "dry-run"`.
+
+### 4. Manual local run with a real key (dry-run)
+
+If you want to see the parsed JSON against a real provider without publishing, run
+the script locally with a provider key — it prints the review and skips publishing
+when `GITHUB_TOKEN` / PR context is absent:
 
 ```bash
 export AI_API_KEY=...
