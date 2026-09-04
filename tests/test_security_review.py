@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -19,9 +21,22 @@ import security_review as sr  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "infra.diff"
 
+META = {"repo": "org/repo", "pr": "7", "base_sha": "base", "head_sha": "head"}
+
 
 def fixture_diff() -> str:
     return FIXTURE.read_text(encoding="utf-8")
+
+
+def completion_body(review: dict) -> bytes:
+    """A minimal valid OpenAI-compatible /chat/completions response body."""
+    return json.dumps(
+        {
+            "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": json.dumps(review)}, "finish_reason": "stop"}
+            ]
+        }
+    ).encode("utf-8")
 
 
 class TestDecodeDiff(unittest.TestCase):
@@ -257,6 +272,187 @@ class TestRawEndToEnd(unittest.TestCase):
         self.assertEqual(added["example/deployment.yaml"], set(range(1, 14)))
         self.assertIn(10, added["example/deployment.yaml"])
         self.assertIn(13, added["example/deployment.yaml"])
+
+
+class TestConfigFromEnv(unittest.TestCase):
+    REQUIRED = {
+        "AI_API_KEY": "sk-test",
+        "AI_BASE_URL": "https://api.example.test/v1/",
+        "AI_MODEL": "model-x",
+    }
+
+    def test_reads_required_vars_and_applies_defaults(self) -> None:
+        with mock.patch.dict(os.environ, self.REQUIRED, clear=True):
+            cfg = sr.Config.from_env()
+        self.assertEqual(cfg.api_key, "sk-test")
+        self.assertEqual(cfg.base_url, "https://api.example.test/v1")
+        self.assertEqual(cfg.model, "model-x")
+        self.assertEqual(cfg.max_diff_chars, 40000)
+        self.assertEqual(cfg.timeout, 90)
+        self.assertTrue(cfg.post_clean_review)
+
+    def test_reads_optional_tuning_vars(self) -> None:
+        env = {**self.REQUIRED, "AI_MAX_DIFF_CHARS": "12000", "AI_TIMEOUT": "30", "POST_CLEAN_REVIEW": "false"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg = sr.Config.from_env()
+        self.assertEqual(cfg.max_diff_chars, 12000)
+        self.assertEqual(cfg.timeout, 30)
+        self.assertFalse(cfg.post_clean_review)
+
+    def test_strips_whitespace_and_base_url_trailing_slash(self) -> None:
+        env = {"AI_API_KEY": "  sk-test  ", "AI_BASE_URL": " https://api.example.test/v1/ ", "AI_MODEL": " model-x "}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg = sr.Config.from_env()
+        self.assertEqual(cfg.api_key, "sk-test")
+        self.assertEqual(cfg.base_url, "https://api.example.test/v1")
+        self.assertEqual(cfg.model, "model-x")
+
+    def test_all_missing_vars_raise_configuration_error(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(sr.AuditError) as ctx:
+                sr.Config.from_env()
+        self.assertEqual(ctx.exception.kind, "configuration")
+        for name in ("AI_API_KEY", "AI_BASE_URL", "AI_MODEL"):
+            self.assertIn(name, ctx.exception.message)
+
+    def test_partial_missing_vars_are_listed(self) -> None:
+        with mock.patch.dict(os.environ, {"AI_API_KEY": "k"}, clear=True):
+            with self.assertRaises(sr.AuditError) as ctx:
+                sr.Config.from_env()
+        # Only the actually-missing vars appear in the missing-variables list.
+        self.assertIn("Missing required environment variable(s): AI_BASE_URL, AI_MODEL", ctx.exception.message)
+        self.assertNotIn("Missing required environment variable(s): AI_API_KEY", ctx.exception.message)
+
+    def test_invalid_optional_ints_fall_back_to_defaults(self) -> None:
+        env = {**self.REQUIRED, "AI_MAX_DIFF_CHARS": "not-a-number", "AI_TIMEOUT": "abc"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg = sr.Config.from_env()
+        self.assertEqual(cfg.max_diff_chars, 40000)
+        self.assertEqual(cfg.timeout, 90)
+
+    def test_diff_chars_floored_at_supported_minimum(self) -> None:
+        with mock.patch.dict(os.environ, {**self.REQUIRED, "AI_MAX_DIFF_CHARS": "100"}, clear=True):
+            cfg = sr.Config.from_env()
+        self.assertEqual(cfg.max_diff_chars, 2600)
+
+
+class TestChatUrl(unittest.TestCase):
+    def test_appends_chat_completions_to_base(self) -> None:
+        cfg = sr.Config("k", "https://api.example.test/v1", "m", 40000, 90, True)
+        self.assertEqual(cfg.chat_url(), "https://api.example.test/v1/chat/completions")
+
+    def test_keeps_full_chat_completions_url(self) -> None:
+        cfg = sr.Config("k", "https://api.example.test/v1/chat/completions", "m", 40000, 90, True)
+        self.assertEqual(cfg.chat_url(), "https://api.example.test/v1/chat/completions")
+
+    def test_strips_trailing_slash_on_full_chat_completions_url(self) -> None:
+        cfg = sr.Config("k", "https://api.example.test/v1/chat/completions/", "m", 40000, 90, True)
+        self.assertEqual(cfg.chat_url(), "https://api.example.test/v1/chat/completions")
+
+
+class TestSystemPrompt(unittest.TestCase):
+    def test_contains_all_five_required_categories(self) -> None:
+        for marker in (
+            "Publicly exposed services or networks",
+            "Hardcoded plaintext secrets",
+            "Permissive IAM policies",
+            "Missing encryption at rest or in transit",
+            "Public S3 buckets / blob containers",
+        ):
+            self.assertIn(marker, sr.SYSTEM_PROMPT)
+
+    def test_explicit_no_findings_json_rule(self) -> None:
+        self.assertIn("EMPTY findings array", sr.SYSTEM_PROMPT)
+        self.assertIn('overall_risk of "low"', sr.SYSTEM_PROMPT)
+        self.assertIn('"findings": [', sr.SYSTEM_PROMPT)
+
+
+class TestAuditDiff(unittest.TestCase):
+    def test_sends_model_configured_request_and_parses_review(self) -> None:
+        review = {
+            "overall_risk": "high",
+            "summary": "Public bucket.",
+            "findings": [
+                {
+                    "severity": "critical",
+                    "title": "Public S3 bucket via ACL",
+                    "file": "example/main.tf",
+                    "line": 7,
+                    "evidence": 'acl = "public-read"',
+                    "recommendation": "Remove the public ACL.",
+                }
+            ],
+        }
+        cfg = sr.Config("sk-test", "https://api.example.test/v1", "model-x", 40000, 90, True)
+        diff = 'resource "aws_s3_bucket" "b" { acl = "public-read" }'
+        with mock.patch.object(sr, "http_post_json", return_value=(200, completion_body(review))) as post:
+            parsed, sent, truncated = sr.audit_diff(cfg, diff, ["example/main.tf"], dict(META))
+        # Canonical output schema is preserved: overall_risk / summary / findings.
+        self.assertEqual(parsed, review)
+        self.assertEqual(sent, len(diff))
+        self.assertFalse(truncated)
+        self.assertEqual(post.call_count, 1)
+
+        url, payload, headers, timeout = post.call_args.args
+        self.assertEqual(url, cfg.chat_url())
+        self.assertEqual(url, "https://api.example.test/v1/chat/completions")
+        self.assertEqual(payload["model"], cfg.model)
+        self.assertEqual(payload["model"], "model-x")
+        self.assertEqual(payload["temperature"], 0)
+        self.assertEqual([m["role"] for m in payload["messages"]], ["system", "user"])
+        self.assertEqual(payload["messages"][0]["content"], sr.SYSTEM_PROMPT)
+        self.assertIn("example/main.tf", payload["messages"][1]["content"])
+        self.assertEqual(headers["Authorization"], "Bearer sk-test")
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertEqual(timeout, cfg.timeout)
+
+    def test_retries_with_halved_diff_on_context_error(self) -> None:
+        review = {"overall_risk": "low", "summary": "clean", "findings": []}
+        cfg = sr.Config("sk-test", "https://api.example.test/v1", "model-x", 40000, 90, True)
+        diff = "x" * 30000
+        effects = [
+            sr.ApiError(400, "This model's maximum context length is 32768 tokens. Reduce the prompt."),
+            (200, completion_body(review)),
+        ]
+        with mock.patch.object(sr, "http_post_json", side_effect=effects) as post:
+            parsed, sent, truncated = sr.audit_diff(cfg, diff, ["f.tf"], dict(META))
+        self.assertEqual(post.call_count, 2)
+        first = post.call_args_list[0].args[1]
+        second = post.call_args_list[1].args[1]
+        # First attempt sends the full diff with no truncation note.
+        self.assertEqual(first["messages"][1]["content"], sr.build_user_prompt(diff, ["f.tf"], dict(META)))
+        # Second attempt halves the sent diff (40000 -> 20000) and flags the truncation.
+        self.assertEqual(sent, 20000)
+        self.assertTrue(truncated)
+        self.assertIn("most recent 20000 characters", second["messages"][1]["content"])
+        self.assertEqual(parsed, review)
+
+    def test_context_error_at_configured_minimum_reports_limit_not_shrink(self) -> None:
+        cfg = sr.Config("sk-test", "https://api.example.test/v1", "model-x", 2600, 90, True)
+        with mock.patch.object(sr, "http_post_json", side_effect=sr.ApiError(400, "context length exceeded")):
+            with self.assertRaises(sr.AuditError) as ctx:
+                sr.audit_diff(cfg, "y" * 5000, ["f.tf"], dict(META))
+        self.assertEqual(ctx.exception.kind, "context_length")
+        # Never shrunk, so the error must not claim so, nor advise lowering the floor.
+        self.assertNotIn("shrinking", ctx.exception.message)
+        self.assertIn("configured limit of 2600", ctx.exception.message)
+        self.assertIn("minimum supported value", ctx.exception.message)
+        self.assertNotIn("Lower AI_MAX_DIFF_CHARS", ctx.exception.message)
+
+    def test_context_error_retry_never_shrinks_below_minimum(self) -> None:
+        cfg = sr.Config("sk-test", "https://api.example.test/v1", "model-x", 40000, 90, True)
+        with mock.patch.object(sr, "http_post_json", side_effect=sr.ApiError(400, "maximum context length exceeded")) as post:
+            with self.assertRaises(sr.AuditError) as ctx:
+                sr.audit_diff(cfg, "z" * 50000, ["f.tf"], dict(META))
+            call_count = post.call_count
+            last_note = post.call_args_list[-1].args[1]["messages"][1]["content"]
+        self.assertEqual(ctx.exception.kind, "context_length")
+        # 40000 -> 20000 -> 10000 -> 6000 (clamped to MIN_DIFF_LIMIT), never below.
+        self.assertEqual(call_count, 4)
+        self.assertIn("most recent 6000 characters", last_note)
+        # The failure message reflects the shrink to the floor without going under it.
+        self.assertIn("shrinking the diff to 6000", ctx.exception.message)
+        self.assertIn("Lower AI_MAX_DIFF_CHARS", ctx.exception.message)
 
 
 if __name__ == "__main__":

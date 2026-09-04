@@ -18,9 +18,11 @@ human can act on it.
 ```
 .
 ├── .github/workflows/security-review.yml   # Workflow: builds the diff, runs the script
-├── scripts/security_review.py              # Main Python script (diff -> AI -> PR review)
+├── scripts/security_review.py              # Cloud entrypoint (diff -> AI -> PR review)
+├── scripts/local_review.py                 # Local entrypoint (OpenCode CLI, no API key)
 ├── tests/
-│   ├── test_security_review.py             # unittest: parser, JSON, inline selection
+│   ├── test_security_review.py             # unittest: cloud parser, JSON, inline selection
+│   ├── test_local_review.py                # unittest: local CLI, prompt, posting (mocked)
 │   └── fixtures/infra.diff                 # Sample diff with real vulnerabilities
 └── README.md
 ```
@@ -77,6 +79,71 @@ The action calls `{AI_BASE_URL}/chat/completions` using the OpenAI
 | `AI_MAX_DIFF_CHARS` | `40000` | Max characters of the diff sent to the model (tail is kept). |
 | `AI_TIMEOUT` | `90` | Request timeout in seconds. |
 | `POST_CLEAN_REVIEW` | `true` | Post a (clean) review when no issues are found. |
+
+---
+
+## Local use (OpenCode CLI — no API key needed)
+
+You can run the **same** DevSecOps audit on your machine without any cloud key:
+`scripts/local_review.py` sends the identical system prompt, diff format and JSON
+schema to your personal **OpenCode** subscription through the local `opencode`
+CLI. It reuses the shared prompt builder, JSON parser and review-body renderer of
+`scripts/security_review.py`.
+
+> **Important**: the local entrypoint uses **your OpenCode subscription via the
+> CLI** and never needs `AI_API_KEY` / `AI_BASE_URL` / `AI_MODEL`. The GitHub
+> Action uses those cloud secrets and does **not** use OpenCode — the two paths
+> are independent. The Action never runs `opencode` and the local script never
+> calls the cloud endpoint.
+
+### Quick path
+
+```bash
+# 1) Audit a git range (infrastructure files only)
+python3 scripts/local_review.py main...my-branch
+
+# 2) Audit a saved diff file
+python3 scripts/local_review.py --diff-file tests/fixtures/infra.diff
+
+# 3) Pipe a diff through standard input
+git diff main...my-branch -- '*.tf' '*.yaml' '*.yml' | python3 scripts/local_review.py
+
+# 4) Pick a different OpenCode model
+python3 scripts/local_review.py main...my-branch --model opencode-go/deepseek-v4-flash
+
+# 5) Post the result as a COMMENT review on a PR (requires gh, authenticated)
+python3 scripts/local_review.py main...my-branch --post-pr 12
+```
+
+The review is printed as readable text (overall risk + per-finding severity,
+title, `file:line`, evidence and recommendation); raw JSON stays internal.
+
+### Input selection
+
+The three inputs are mutually exclusive — passing both a range and `--diff-file`
+is rejected with usage error (exit code 2).
+
+| Input | Command | Notes |
+| --- | --- | --- |
+| Git range | `python3 scripts/local_review.py BASE...HEAD` | Runs `git diff --diff-filter=ACMR BASE...HEAD -- '*.tf' '*.yaml' '*.yml'` and keeps only added/modified content |
+| Diff file | `--diff-file path.diff` | Reads a unified diff from disk |
+| Standard input | no range/flag, or `--diff-file -` | Reads a unified diff from stdin (usable in pipes) |
+
+### Model and posting
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--model NAME` | `opencode-go/deepseek-v4-flash` | Model used by `opencode run` |
+| `--post-pr NUM` | — | Post the review to PR `NUM` via `gh api` (`event: COMMENT`); without it, the review is only printed |
+
+`AI_MAX_DIFF_CHARS` (default `40000`) still bounds the diff sent to the model.
+
+### Checklist
+
+- [ ] `opencode` is on your `PATH` and signed in with your personal subscription
+- [ ] Run range mode inside a Git repository
+- [ ] `--post-pr` requires `gh` authenticated with `repo` scope; the review is
+      posted from your personal account and is advisory — otherwise use print mode
 
 ---
 

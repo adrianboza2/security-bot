@@ -64,7 +64,8 @@ CONTEXT_ERROR_RE = re.compile(
 )
 
 MAX_INLINE_COMMENTS = 25
-MIN_DIFF_LIMIT = 6000
+MIN_DIFF_LIMIT = 6000  # smallest diff size the context-retry loop will attempt
+MIN_DIFF_CHARS = 2600  # smallest AI_MAX_DIFF_CHARS Config will accept
 
 
 class AuditError(Exception):
@@ -121,14 +122,15 @@ Respond with ONLY one JSON object (no markdown code fences, no commentary before
 
 
 def build_user_prompt(diff_chunk: str, file_list: list[str], meta: dict[str, str], note: str = "") -> str:
-    lines = [
-        "Review context:",
-        f"- Repository: {meta['repo']}",
-        f"- Pull request #{meta['pr']}",
-        f"- Diff range: {meta['base_sha']} -> {meta['head_sha']}",
-        "- Audit scope: changes to Terraform (.tf) and Kubernetes (.yaml/.yml) files only.",
-        "Infrastructure files changed in this diff:",
-    ]
+    lines = ["Review context:"]
+    if meta.get("repo"):
+        lines.append(f"- Repository: {meta['repo']}")
+    if meta.get("pr"):
+        lines.append(f"- Pull request #{meta['pr']}")
+    if meta.get("base_sha") or meta.get("head_sha"):
+        lines.append(f"- Diff range: {meta['base_sha']} -> {meta['head_sha']}")
+    lines.append("- Audit scope: changes to Terraform (.tf) and Kubernetes (.yaml/.yml) files only.")
+    lines.append("Infrastructure files changed in this diff:")
     for path in file_list:
         lines.append(f"  - {path}")
     if meta.get("title"):
@@ -142,6 +144,15 @@ def build_user_prompt(diff_chunk: str, file_list: list[str], meta: dict[str, str
     lines.append(diff_chunk)
     lines.append("```")
     return "\n".join(lines)
+
+
+def build_audit_prompt(diff_chunk: str, file_list: list[str], meta: dict[str, str], note: str = "") -> str:
+    """Compose the full model prompt: the shared system prompt plus the user audit request.
+
+    Local (scripts/local_review.py) and cloud entrypoints use this single builder so
+    the DevSecOps system prompt and the audit request format never drift apart.
+    """
+    return f"{SYSTEM_PROMPT}\n\n{build_user_prompt(diff_chunk, file_list, meta, note)}"
 
 
 # --------------------------------------------------------------------------- #
@@ -178,7 +189,7 @@ class Config:
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
-        self.max_diff_chars = max(2600, max_diff_chars)
+        self.max_diff_chars = max(MIN_DIFF_CHARS, max_diff_chars)
         self.timeout = max(5, timeout)
         self.post_clean_review = post_clean_review
 
@@ -407,10 +418,12 @@ def audit_diff(cfg: Config, diff: str, files: list[str], meta: dict[str, str]) -
     """Call the model and return (parsed review, chars actually sent, was truncated).
 
     If the provider answers 400 with a context-length error, shrink the diff by half
-    and retry. On eventual failure raise AuditError with a clear message.
+    (never below MIN_DIFF_LIMIT) and retry. On eventual failure raise AuditError with
+    a clear message.
     """
     limit = cfg.max_diff_chars
     note = ""
+    shrunk = False
     while True:
         chunk, truncated = truncate_text(diff, limit)
         user_prompt = build_user_prompt(chunk, files, meta, note)
@@ -432,18 +445,31 @@ def audit_diff(cfg: Config, diff: str, files: list[str], meta: dict[str, str]) -
         except ApiError as exc:
             if exc.status == 400 and CONTEXT_ERROR_RE.search(exc.body):
                 if limit > MIN_DIFF_LIMIT:
-                    limit = limit // 2
+                    limit = max(MIN_DIFF_LIMIT, limit // 2)
+                    shrunk = True
                     note = (
                         f"[Note: the diff was truncated to its most recent {limit} characters to fit "
                         "the model context window. Only the content visible below was audited.]"
                     )
                     continue
+                if shrunk:
+                    detail = f"even after shrinking the diff to {limit} characters. "
+                    hint = "Lower AI_MAX_DIFF_CHARS or switch to a model with a larger context window."
+                else:
+                    detail = f"at the configured limit of {limit} characters. "
+                    if limit > MIN_DIFF_CHARS:
+                        hint = "Lower AI_MAX_DIFF_CHARS or switch to a model with a larger context window."
+                    else:
+                        hint = (
+                            "AI_MAX_DIFF_CHARS is already at its minimum supported value; "
+                            "switch to a model with a larger context window."
+                        )
                 raise AuditError(
                     "context_length",
-                    "The AI provider rejected the prompt with HTTP 400 (context length) even after "
-                    f"shrinking the diff to {limit} characters. Lower AI_MAX_DIFF_CHARS or switch to a "
-                    "model with a larger context window. "
-                    f"Provider response: {exc.body[:300]}",
+                    "The AI provider rejected the prompt with HTTP 400 (context length) "
+                    + detail
+                    + hint
+                    + f" Provider response: {exc.body[:300]}",
                 ) from exc
             if exc.status in (401, 403):
                 raise AuditError(
@@ -658,7 +684,7 @@ def deliver_review(
     if 200 <= status3 < 300:
         result["posted"] = "issue_comment"
         result["notes"] = (
-            f"review API rejected (lets see: {status}/{status2}); "
+            f"review API rejected (HTTP {status}/{status2}); "
             f"posted as issue comment instead; review bodies: {resp_body[:200]} | {resp2[:200]}"
         )
         return result
